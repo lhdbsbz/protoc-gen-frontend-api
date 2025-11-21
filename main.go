@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -13,10 +14,17 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
+// 输出路径配置
+type OutputPathConfig struct {
+	Path          string // 输出路径
+	ServiceImport string // 该路径对应的 service 导入路径（可选，如果为空则使用全局的）
+}
+
 // 插件配置
 type PluginConfig struct {
-	ServiceImport string // service 导入路径（相对路径，如 './api.js'）
-	OutputDir     string // 输出目录路径（可选，如果提供则手动创建）
+	ServiceImport string              // service 导入路径（相对路径，如 './api.js'）
+	OutputDir     string              // 输出目录路径（可选，如果提供则手动创建，用于向后兼容）
+	OutputPaths   []OutputPathConfig  // 多个输出路径配置（新功能）
 }
 
 // 方法信息结构体
@@ -48,11 +56,26 @@ func main() {
 			return fmt.Errorf("解析插件参数失败: %v", err)
 		}
 
-		// 如果配置中指定了输出目录，确保目录存在
+		// 如果配置中指定了输出目录，确保目录存在（向后兼容）
 		if config.OutputDir != "" {
 			if err := os.MkdirAll(config.OutputDir, 0755); err != nil {
 				return fmt.Errorf("创建输出目录失败: %v", err)
 			}
+		}
+
+		// 如果配置了多个输出路径，确保所有目录存在
+		for _, outputPath := range config.OutputPaths {
+			if err := os.MkdirAll(outputPath.Path, 0755); err != nil {
+				return fmt.Errorf("创建输出目录失败: %v", err)
+			}
+		}
+
+		// 获取默认输出路径（从 --frontend-api_out 参数获取）
+		defaultOutputPath := ""
+		if len(gen.Request.FileToGenerate) > 0 {
+			// protogen 没有直接提供输出路径，我们需要从参数中推断
+			// 但我们可以通过 NewGeneratedFile 来使用默认路径
+			// 这里我们保持原有逻辑，如果没有配置 output_paths，就使用默认路径
 		}
 
 		for _, f := range gen.Files {
@@ -63,7 +86,7 @@ func main() {
 			// 查找服务定义
 			for _, service := range f.Services {
 				// 生成前端 API 文件
-				if err := generateFrontendApi(gen, f, service, config); err != nil {
+				if err := generateFrontendApi(gen, f, service, config, defaultOutputPath); err != nil {
 					return err
 				}
 			}
@@ -76,6 +99,7 @@ func main() {
 func parsePluginOptions(param string) (*PluginConfig, error) {
 	config := &PluginConfig{
 		ServiceImport: "./api.js", // 默认 service 导入路径
+		OutputPaths:   []OutputPathConfig{},
 	}
 
 	if param == "" {
@@ -97,6 +121,31 @@ func parsePluginOptions(param string) (*PluginConfig, error) {
 			config.ServiceImport = value
 		case "output_dir":
 			config.OutputDir = value
+		case "output_paths":
+			// 解析多个输出路径，格式: path1;path2;path3 或 path1:import1;path2:import2
+			paths := strings.Split(value, ";")
+			for _, pathStr := range paths {
+				pathStr = strings.TrimSpace(pathStr)
+				if pathStr == "" {
+					continue
+				}
+				// 检查是否包含 service_import，格式: path:import
+				if strings.Contains(pathStr, ":") {
+					parts := strings.SplitN(pathStr, ":", 2)
+					if len(parts) == 2 {
+						config.OutputPaths = append(config.OutputPaths, OutputPathConfig{
+							Path:          strings.TrimSpace(parts[0]),
+							ServiceImport: strings.TrimSpace(parts[1]),
+						})
+					}
+				} else {
+					// 只有路径，使用全局的 service_import
+					config.OutputPaths = append(config.OutputPaths, OutputPathConfig{
+						Path:          pathStr,
+						ServiceImport: "", // 空字符串表示使用全局的
+					})
+				}
+			}
 		}
 	}
 
@@ -104,11 +153,7 @@ func parsePluginOptions(param string) (*PluginConfig, error) {
 }
 
 // generateFrontendApi 生成前端 API 文件
-func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *protogen.Service, config *PluginConfig) error {
-	// 确保输出目录存在（protogen 应该会自动创建，但为了保险，我们手动创建）
-	// 注意：protogen 的输出目录是从 --frontend-api_out 参数获取的
-	// 我们无法直接访问，但 NewGeneratedFile 会自动创建目录
-	// 如果自动创建失败，我们会在写入时看到错误
+func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *protogen.Service, config *PluginConfig, defaultOutputPath string) error {
 	// 服务名称（去掉 Service 后缀）
 	serviceName := strings.TrimSuffix(string(service.Desc.Name()), "Service")
 
@@ -137,6 +182,48 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 	// 尝试从 proto 文件中读取服务注释
 	serviceComment := getServiceComment(service)
 
+	// 生成文件名（使用小驼峰命名）
+	fileName := toCamelCase(serviceName) + "Api.js"
+
+	// 如果配置了多个输出路径，对每个路径都生成文件
+	if len(config.OutputPaths) > 0 {
+		for _, outputPathConfig := range config.OutputPaths {
+			// 确定该路径使用的 service_import
+			serviceImport := outputPathConfig.ServiceImport
+			if serviceImport == "" {
+				serviceImport = config.ServiceImport
+			}
+
+			// 准备模板数据
+			data := ServiceInfo{
+				ServiceName:   serviceName,
+				ApiFileName:   apiFileName,
+				Methods:       methods,
+				ServiceImport: serviceImport,
+				Comment:       serviceComment,
+			}
+
+			// 生成代码
+			code := generateApiCode(data)
+
+			// 构建完整输出路径（使用 filepath.Join 确保跨平台兼容）
+			fullPath := filepath.Join(outputPathConfig.Path, fileName)
+
+			// 确保目录存在
+			dir := outputPathConfig.Path
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return fmt.Errorf("创建输出目录失败 %s: %v", dir, err)
+			}
+
+			// 直接写入文件
+			if err := os.WriteFile(fullPath, code, 0644); err != nil {
+				return fmt.Errorf("写入文件失败 %s: %v", fullPath, err)
+			}
+		}
+		return nil
+	}
+
+	// 向后兼容：使用原有的方式（通过 protogen 的 NewGeneratedFile）
 	// 准备模板数据
 	data := ServiceInfo{
 		ServiceName:   serviceName,
@@ -147,11 +234,42 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 	}
 
 	// 生成代码
+	code := generateApiCode(data)
+
+	// protoc 会将 --frontend-api_out 指定的目录作为基础路径
+	// 我们只需要指定文件名，protogen 会自动处理输出目录
+	outputPath := fileName
+
+	// 创建输出文件（protogen 会自动处理输出目录，即 --frontend-api_out 指定的目录）
+	g := gen.NewGeneratedFile(outputPath, "")
+
+	// 写入文件内容
+	// protogen 会在写入时自动创建目录，如果目录不存在
+	if _, err := g.Write(code); err != nil {
+		// 如果写入失败，可能是因为目录不存在
+		// 如果配置中指定了输出目录，尝试手动创建
+		if config.OutputDir != "" {
+			if err := os.MkdirAll(config.OutputDir, 0755); err == nil {
+				// 目录创建成功，重试写入
+				if _, err := g.Write(code); err != nil {
+					return fmt.Errorf("写入文件失败: %v", err)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("写入文件失败: %v (请确保输出目录存在且有写权限)", err)
+	}
+
+	return nil
+}
+
+// generateApiCode 生成 API 代码内容
+func generateApiCode(data ServiceInfo) []byte {
 	var buf bytes.Buffer
 
 	// 写入 import
 	buf.WriteString("import service from '")
-	buf.WriteString(config.ServiceImport)
+	buf.WriteString(data.ServiceImport)
 	buf.WriteString("';\n\n")
 
 	// 写入注释
@@ -187,35 +305,7 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 	buf.WriteString(data.ApiFileName)
 	buf.WriteString(";\n")
 
-	// 生成文件名（使用小驼峰命名）
-	fileName := toCamelCase(serviceName) + "Api.js"
-
-	// protoc 会将 --frontend-api_out 指定的目录作为基础路径
-	// 我们只需要指定文件名，protogen 会自动处理输出目录
-	// 直接使用文件名，不使用额外的 output_dir 配置
-	outputPath := fileName
-
-	// 创建输出文件（protogen 会自动处理输出目录，即 --frontend-api_out 指定的目录）
-	g := gen.NewGeneratedFile(outputPath, "")
-
-	// 写入文件内容
-	// protogen 会在写入时自动创建目录，如果目录不存在
-	if _, err := g.Write(buf.Bytes()); err != nil {
-		// 如果写入失败，可能是因为目录不存在
-		// 如果配置中指定了输出目录，尝试手动创建
-		if config.OutputDir != "" {
-			if err := os.MkdirAll(config.OutputDir, 0755); err == nil {
-				// 目录创建成功，重试写入
-				if _, err := g.Write(buf.Bytes()); err != nil {
-					return fmt.Errorf("写入文件失败: %v", err)
-				}
-				return nil
-			}
-		}
-		return fmt.Errorf("写入文件失败: %v (请确保输出目录存在且有写权限)", err)
-	}
-
-	return nil
+	return buf.Bytes()
 }
 
 // extractHttpRule 从方法中提取 HTTP 规则

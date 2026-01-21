@@ -111,10 +111,10 @@ export default service;
 
 ```bash
 # 多项目 TS，共用一个 types
---frontend-api_opt=output_paths="proj1/src/api/grpc-gateway;proj2/src/api/grpc-gateway",types_import_path=@/api/proto-types,service_import=@/api/api
+--frontend-api_opt=output_paths="project1/src/api/grpc-gateway;project2/src/api/grpc-gateway",types_import_path=@/api/proto-types,service_import=@/api/api
 
 # TS + JS 同时出
---frontend-api_opt=output_paths="mulan/src/api/grpc-gateway",output_paths_js="shop-operating/src/api/grpc-gateway",service_import=@/api/api,service_import_js=@/api/api.js,types_import_path=@/api/proto-types
+--frontend-api_opt=output_paths="frontend-ts/src/api/grpc-gateway",output_paths_js="frontend-js/src/api/grpc-gateway",service_import=@/api/api,service_import_js=@/api/api.js,types_import_path=@/api/proto-types
 ```
 
 ---

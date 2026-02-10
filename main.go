@@ -213,15 +213,14 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 	// 用于生成正确的 import 语句
 	typeImports := collectTypeImports(gen, service, methods)
 
-	// 收集所有输出路径配置（只使用 TS 路径）
+	// 收集所有输出路径配置（TS 与 JS 至少需配置一种）
 	allOutputPaths := config.OutputPaths
 
-	// 如果没有配置输出路径，跳过生成
-	if len(allOutputPaths) == 0 {
+	if len(config.OutputPaths) == 0 && len(config.OutputPathsJS) == 0 {
 		return nil
 	}
 
-	// 对每个路径都生成文件
+	// 对每个路径都生成 TS 文件
 	for _, outputPathConfig := range allOutputPaths {
 		// 确定该路径使用的 service_import
 		serviceImport := outputPathConfig.ServiceImport

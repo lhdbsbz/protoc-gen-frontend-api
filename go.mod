@@ -1,8 +1,8 @@
 module github.com/lhdbsbz/protoc-gen-frontend-api
 
-go 1.25.1
+go 1.26.1
 
 require (
-	google.golang.org/genproto/googleapis/api v0.0.0-20250929231259-57b25ae835d4
-	google.golang.org/protobuf v1.36.10
+	google.golang.org/genproto/googleapis/api v0.0.0-20260319201613-d00831a3d3e7
+	google.golang.org/protobuf v1.36.11
 )

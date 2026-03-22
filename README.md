@@ -1,6 +1,6 @@
 # protoc-gen-frontend-api
 
-从带 `google.api.http` 的 proto 生成前端 API 封装（`*Api.ts` 或 `*Api.js`）。**不生成类型**，TS 版引用 [ts-proto](https://github.com/stephenh/ts-proto) 的类型；JS 版无类型、不依赖 proto-types。
+从带 `google.api.http` 的 proto 生成前端 API 封装（`*Api.ts` 或 `*Api.js`）。**不生成类型**：TS 版引用 [ts-proto](https://github.com/stephenh/ts-proto) 的类型；JS 版无类型、不依赖 proto-types。
 
 ---
 
@@ -14,62 +14,56 @@ go install github.com/lhdbsbz/protoc-gen-frontend-api@main
 
 ---
 
-## 快速开始
+## `--frontend-api_opt` 参数
 
-### TypeScript 项目
+逗号分隔的 `key=value`。键名采用与常见 protoc 插件一致的 **snake_case**（如 `paths=source_relative`）。**未知键会直接报错**。
 
-1. 先用 **ts-proto** 生成类型到 `proto-types/`（`onlyTypes=true`）。
-2. 在 protoc 中挂上本插件，传入 `output_paths` 和 `types_import_path`：
+| 键 | 含义 | 默认 |
+|----|------|------|
+| `typescript_outputs` | TS 输出目录，多个用 `;`；每项可为 `dir` 或 `dir:该目录专用 service 路径` | — |
+| `javascript_outputs` | JS 输出目录，格式同上 | — |
+| `types_from` | ts-proto 类型根路径（仅 TS 生成需要） | `@/api/proto-types` |
+| `service_import` | `import service from '…'` 的路径（TS；JS 未单独指定时沿用） | `./api` |
+| `service_import_js` | 仅 JS 输出的 service 路径 | 同 `service_import` |
+
+`typescript_outputs` 与 `javascript_outputs` 至少配置其一才有输出。生成前会**清空**所列目录。
+
+`--frontend-api_out` 是 protoc 要求的输出根路径，建议与对应列表中的**第一个目录**一致；实际写文件仍按 opt 里的路径。
+
+---
+
+## TypeScript 示例
+
+1. 先用 **ts-proto** 生成类型（如 `onlyTypes=true`）。
+2. 调用本插件：
 
 ```bash
 protoc --proto_path=. --proto_path=proto_third \
   --plugin=protoc-gen-frontend-api=$(go env GOBIN)/protoc-gen-frontend-api \
-  --frontend-api_out=. \
-  --frontend-api_opt=service_import=@/api/api,output_paths="src/api/grpc-gateway",types_import_path=@/api/proto-types \
+  --frontend-api_out=src/api/grpc-gateway \
+  --frontend-api_opt=typescript_outputs=src/api/grpc-gateway,types_from=@/api/proto-types,service_import=@/api/api \
   proto/**/*.proto
 ```
 
-生成 `userApi.ts`、`orderApi.ts` 等，`import type` 来自 proto-types。
+---
 
-### JavaScript 项目
+## JavaScript 示例
 
-只传 `output_paths_js`，**无需** proto-types、无需 ts-proto：
+无需 ts-proto：
 
 ```bash
 protoc --proto_path=. --proto_path=proto_third \
   --plugin=protoc-gen-frontend-api=$(go env GOBIN)/protoc-gen-frontend-api \
-  --frontend-api_out=. \
-  --frontend-api_opt=service_import_js=@/api/api.js,output_paths_js="src/api/grpc-gateway" \
+  --frontend-api_out=src/api/grpc-gateway \
+  --frontend-api_opt=javascript_outputs=src/api/grpc-gateway,service_import_js=@/api/api.js \
   proto/**/*.proto
 ```
 
-生成 `userApi.js`、`orderApi.js` 等，无类型 import，`(data) => service.post('path', data)` 风格。
-
 ---
 
-## 参数
+## 生成物示例
 
-`--frontend-api_opt=` 内用逗号分隔，格式：`key=value`。
-
-| 参数 | 含义 | 默认 |
-|------|------|------|
-| `output_paths` | TS 输出目录，多个用 `;` | — |
-| `output_paths_js` | JS 输出目录，多个用 `;` | — |
-| `service_import` | TS 的 service 导入（如 `@/api/api`） | `./api` |
-| `service_import_js` | JS 的 service 导入（如 `@/api/api.js`） | 同 `service_import` |
-| `types_import_path` | ts-proto 类型根路径（仅 TS） | `@/api/proto-types` |
-
-**路径格式**：`path1;path2` 或 `path1:自定义service导入;path2`。
-
-**说明**：`--frontend-api_out` 为 protoc 必填，本插件不读，填 `.` 即可；实际输出由 `output_paths` / `output_paths_js` 决定。生成前会清空这些目录，Makefile 不必再 `rm -rf`。
-
----
-
-## 生成示例
-
-**Proto**：RPC 带 `option (google.api.http) = { post: "/xxx" body: "*" }`。
-
-**TS（userApi.ts）**：
+**TS（`userApi.ts`）**
 
 ```ts
 import service from '@/api/api';
@@ -81,7 +75,7 @@ export const userApi = {
 export default userApi;
 ```
 
-**JS（userApi.js）**：
+**JS（`userApi.js`）**
 
 ```js
 import service from '@/api/api.js';
@@ -92,39 +86,31 @@ export const userApi = {
 export default userApi;
 ```
 
-服务名去 `Service`、首字母小写即文件名：`UserService` → `userApi`。
+`UserService` → 文件名 `userApi`。
 
 ---
 
-## 对 service 的要求
+## 对 service 模块的要求
 
-`service_import` 指向的模块需 **默认导出** 含 `get`、`post`、`put`、`delete`、`patch` 的对象，例如基于 axios 的封装：
-
-```ts
-const service = axios.create({ baseURL: '...' });
-export default service;
-```
+`service_import` / `service_import_js` 指向的模块需 **默认导出** 含 `get`、`post`、`put`、`delete`、`patch` 的对象（如 axios 实例）。
 
 ---
 
-## 常用写法
+## 多目录 / TS+JS 同时出
 
 ```bash
-# 多项目 TS，共用一个 types
---frontend-api_opt=output_paths="project1/src/api/grpc-gateway;project2/src/api/grpc-gateway",types_import_path=@/api/proto-types,service_import=@/api/api
+--frontend-api_opt=typescript_outputs=app1/src/api/grpc-gateway;app2/src/api/grpc-gateway,types_from=@/api/proto-types,service_import=@/api/api
 
-# TS + JS 同时出
---frontend-api_opt=output_paths="frontend-ts/src/api/grpc-gateway",output_paths_js="frontend-js/src/api/grpc-gateway",service_import=@/api/api,service_import_js=@/api/api.js,types_import_path=@/api/proto-types
+--frontend-api_opt=typescript_outputs=frontend-ts/src/api/grpc-gateway,javascript_outputs=frontend-js/src/api/grpc-gateway,service_import=@/api/api,service_import_js=@/api/api.js,types_from=@/api/proto-types
 ```
 
 ---
 
 ## 常见问题
 
-- **RPC 没出现在 API 里？** 只处理带 `google.api.http` 的 RPC，检查是否加了 `option (google.api.http) = { ... }`。
-- **TS 报 `Cannot find module '@/api/proto-types/...'`？** 先跑 ts-proto；确认 `types_import_path`、ts-proto 的 `--ts_proto_out` 与项目路径/别名一致。
-- **Makefile 要 `rm -rf` 前端 API 目录吗？** 不要，插件会在生成前清空 `output_paths` / `output_paths_js`。
-- **JS 要跑 ts-proto 吗？** 不要，`output_paths_js` 不依赖 proto-types。
+- **RPC 没进 API？** 只处理带 `option (google.api.http) = { … }` 的方法。
+- **TS 找不到 proto-types？** 先跑 ts-proto；核对 `types_from` 与 ts-proto 输出、路径别名一致。
+- **还要不要 Makefile 里 `rm -rf` 前端目录？** 不必，插件会清空 `typescript_outputs` / `javascript_outputs` 所列目录。
 
 ---
 

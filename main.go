@@ -21,13 +21,13 @@ type OutputPathConfig struct {
 	ServiceImport string // 该路径对应的 service 导入路径（可选，如果为空则使用全局的）
 }
 
-// 插件配置
+// 插件配置（对应 --frontend-api_opt）
 type PluginConfig struct {
-	ServiceImport   string             // service 导入路径（TS，及 JS 在未指定 service_import_js 时）
-	ServiceImportJS string             // JS 专用 service 导入路径（可选，如 '@/api/api.js'）
-	TypesImportPath string             // 类型定义导入路径前缀（如 '@/api/proto-types'，仅 TS 使用）
-	OutputPaths     []OutputPathConfig // TS 输出路径
-	OutputPathsJS   []OutputPathConfig // JS 输出路径（按 addressApi.js 风格，无类型 import）
+	ServiceImport   string             // TS 默认；JS 在未设 ServiceImportJS 时回退到此
+	ServiceImportJS string             // JS 专用 service 导入（可选）
+	TypesRoot       string             // ts-proto 类型根路径前缀（仅 TS）
+	TsOut           []OutputPathConfig // TypeScript *Api.ts 输出目录
+	JsOut           []OutputPathConfig // JavaScript *Api.js 输出目录
 }
 
 // 方法信息结构体
@@ -44,9 +44,9 @@ type ServiceInfo struct {
 	ServiceName     string              // 服务名称（去掉 Service 后缀）
 	ApiFileName     string              // API 文件名（如 productApi）
 	Methods         []MethodInfo        // 方法列表
-	ServiceImport   string              // service 导入路径
-	TypesImportPath string              // 类型定义导入路径前缀（如 @/api/proto-types）
-	TypeImports     map[string][]string // 需要导入的类型列表 (importPath -> sortedTypeNames)
+	ServiceImport string              // service 模块路径
+	TypesRoot     string              // ts-proto 类型根路径前缀
+	TypeImports   map[string][]string // importPath -> sorted type names
 }
 
 func main() {
@@ -59,18 +59,18 @@ func main() {
 
 		config, err := parsePluginOptions(param)
 		if err != nil {
-			return fmt.Errorf("解析插件参数失败: %v", err)
+			return fmt.Errorf("frontend-api: %w", err)
 		}
 
 		// 生成前清空各输出目录，确保只保留本次生成的文件（便于 proto 删除服务时移除旧 API）
-		for _, outputPath := range config.OutputPaths {
+		for _, outputPath := range config.TsOut {
 			if err := clearOutputDir(outputPath.Path); err != nil {
-				return fmt.Errorf("清空输出目录失败 %s: %v", outputPath.Path, err)
+				return fmt.Errorf("清空 TS 输出目录失败 %s: %v", outputPath.Path, err)
 			}
 		}
-		for _, outputPath := range config.OutputPathsJS {
+		for _, outputPath := range config.JsOut {
 			if err := clearOutputDir(outputPath.Path); err != nil {
-				return fmt.Errorf("清空输出目录失败(JS) %s: %v", outputPath.Path, err)
+				return fmt.Errorf("清空 JS 输出目录失败 %s: %v", outputPath.Path, err)
 			}
 		}
 
@@ -91,42 +91,57 @@ func main() {
 	})
 }
 
-// parsePluginOptions 解析插件参数
+// parsePluginOptions 解析 --frontend-api_opt：逗号分隔的 key=value（键名 snake_case，与常见 protoc 插件一致）。
+// 合法键：typescript_outputs, javascript_outputs, types_from, service_import, service_import_js。
 func parsePluginOptions(param string) (*PluginConfig, error) {
 	config := &PluginConfig{
-		ServiceImport:   "./api",             // 默认 service 导入路径
-		ServiceImportJS: "",                  // 为空时 JS 使用 ServiceImport
-		TypesImportPath: "@/api/proto-types", // 默认类型定义导入路径
-		OutputPaths:     []OutputPathConfig{},
-		OutputPathsJS:   []OutputPathConfig{},
+		ServiceImport:   "./api",
+		ServiceImportJS: "",
+		TypesRoot:       "@/api/proto-types",
+		TsOut:           nil,
+		JsOut:           nil,
 	}
 
-	if param == "" {
+	if strings.TrimSpace(param) == "" {
 		return config, nil
 	}
 
-	// 解析参数，格式: key1=value1,key2=value2
-	pairs := strings.Split(param, ",")
-	for _, pair := range pairs {
-		kv := strings.SplitN(pair, "=", 2)
-		if len(kv) != 2 {
+	for _, pair := range strings.Split(param, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
 			continue
 		}
-		key := strings.TrimSpace(kv[0])
-		value := strings.TrimSpace(kv[1])
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			return nil, fmt.Errorf("frontend-api: invalid option %q (want key=value)", pair)
+		}
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if key == "" {
+			return nil, fmt.Errorf("frontend-api: empty key in %q", pair)
+		}
 
 		switch key {
+		case "typescript_outputs":
+			if value == "" {
+				return nil, fmt.Errorf("frontend-api: typescript_outputs= requires a value (semicolon-separated dirs, optional path:import per entry)")
+			}
+			config.TsOut = parseTargetPaths(value)
+		case "javascript_outputs":
+			if value == "" {
+				return nil, fmt.Errorf("frontend-api: javascript_outputs= requires a value (semicolon-separated dirs, optional path:import per entry)")
+			}
+			config.JsOut = parseTargetPaths(value)
+		case "types_from":
+			if value == "" {
+				return nil, fmt.Errorf("frontend-api: types_from= requires a value")
+			}
+			config.TypesRoot = value
 		case "service_import":
 			config.ServiceImport = value
 		case "service_import_js":
 			config.ServiceImportJS = value
-		case "types_import_path":
-			config.TypesImportPath = value
-		case "output_paths":
-			// 解析输出路径，格式: path1;path2;path3 或 path1:import1;path2:import2
-			config.OutputPaths = parseOutputPaths(value)
-		case "output_paths_js":
-			config.OutputPathsJS = parseOutputPaths(value)
+		default:
+			return nil, fmt.Errorf("frontend-api: unknown option %q", key)
 		}
 	}
 
@@ -151,8 +166,8 @@ func clearOutputDir(dir string) error {
 	return os.MkdirAll(dir, 0755)
 }
 
-// parseOutputPaths 解析输出路径配置
-func parseOutputPaths(value string) []OutputPathConfig {
+// parseTargetPaths：分号分隔；每项可为 `dir` 或 `dir:override_service_import`。
+func parseTargetPaths(value string) []OutputPathConfig {
 	var paths []OutputPathConfig
 	for _, pathStr := range strings.Split(value, ";") {
 		pathStr = strings.TrimSpace(pathStr)
@@ -213,15 +228,11 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 	// 用于生成正确的 import 语句
 	typeImports := collectTypeImports(gen, service, methods)
 
-	// 收集所有输出路径配置（TS 与 JS 至少需配置一种）
-	allOutputPaths := config.OutputPaths
-
-	if len(config.OutputPaths) == 0 && len(config.OutputPathsJS) == 0 {
+	if len(config.TsOut) == 0 && len(config.JsOut) == 0 {
 		return nil
 	}
 
-	// 对每个路径都生成 TS 文件
-	for _, outputPathConfig := range allOutputPaths {
+	for _, outputPathConfig := range config.TsOut {
 		// 确定该路径使用的 service_import
 		serviceImport := outputPathConfig.ServiceImport
 		if serviceImport == "" {
@@ -230,12 +241,12 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 
 		// 准备模板数据
 		data := ServiceInfo{
-			ServiceName:     serviceName,
-			ApiFileName:     apiFileName,
-			Methods:         methods,
-			ServiceImport:   serviceImport,
-			TypesImportPath: config.TypesImportPath,
-			TypeImports:     typeImports,
+			ServiceName:   serviceName,
+			ApiFileName:   apiFileName,
+			Methods:       methods,
+			ServiceImport: serviceImport,
+			TypesRoot:     config.TypesRoot,
+			TypeImports:   typeImports,
 		}
 
 		// 生成 TypeScript 代码
@@ -256,8 +267,7 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 		}
 	}
 
-	// 按 output_paths_js 生成 JS 接口（无类型 import，(data) => service.{method}('path', data)）
-	for _, outputPathConfig := range config.OutputPathsJS {
+	for _, outputPathConfig := range config.JsOut {
 		serviceImport := outputPathConfig.ServiceImport
 		if serviceImport == "" {
 			serviceImport = config.ServiceImportJS
@@ -487,7 +497,7 @@ func generateTypeScriptCode(data ServiceInfo) []byte {
 		sort.Strings(importPaths)
 		for _, importPath := range importPaths {
 			typeNames := data.TypeImports[importPath]
-			fullImportPath := data.TypesImportPath
+			fullImportPath := data.TypesRoot
 			if !strings.HasSuffix(fullImportPath, "/") && importPath != "" {
 				fullImportPath += "/"
 			}

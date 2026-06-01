@@ -524,14 +524,14 @@ func generateTypeScriptCode(data ServiceInfo) []byte {
 		buf.WriteString(method.MethodName)
 		buf.WriteString(": (data: ")
 		buf.WriteString(method.RequestType)
-		buf.WriteString("): Promise<")
+		buf.WriteString(", opts?: object): Promise<")
 		buf.WriteString(method.ResponseType)
 		buf.WriteString("> =>\n")
 		buf.WriteString("    service.")
 		buf.WriteString(method.HttpMethod)
 		buf.WriteString("('")
 		buf.WriteString(method.HttpPath)
-		buf.WriteString("', data)")
+		buf.WriteString("', data, opts)")
 
 		if i < len(data.Methods)-1 {
 			buf.WriteString(",\n")
@@ -548,7 +548,8 @@ func generateTypeScriptCode(data ServiceInfo) []byte {
 	return buf.Bytes()
 }
 
-// generateJavaScriptCode 按 addressApi.js 风格生成 JS：无类型 import，(data) => service.{method}('path', data)
+// generateJavaScriptCode 按 addressApi.js 风格生成 JS：无类型 import，(data, opts) => service.{method}('path', data, opts)
+// opts 透传给 request 层（per-call 选项：toast/dedupe 等）
 func generateJavaScriptCode(data ServiceInfo) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("import service from '")
@@ -560,11 +561,11 @@ func generateJavaScriptCode(data ServiceInfo) []byte {
 	for i, method := range data.Methods {
 		buf.WriteString("    ")
 		buf.WriteString(method.MethodName)
-		buf.WriteString(": (data) => service.")
+		buf.WriteString(": (data, opts) => service.")
 		buf.WriteString(method.HttpMethod)
 		buf.WriteString("('")
 		buf.WriteString(method.HttpPath)
-		buf.WriteString("', data)")
+		buf.WriteString("', data, opts)")
 		if i < len(data.Methods)-1 {
 			buf.WriteString(",\n")
 		} else {

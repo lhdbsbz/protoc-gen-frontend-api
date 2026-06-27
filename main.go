@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -281,7 +282,8 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 			Methods:       methods,
 			ServiceImport: serviceImport,
 		}
-		code := generateJavaScriptCode(data)
+		// 按目标目录所属项目的 prettier 配置生成，避免生成后被编辑器/lint-staged 重新格式化
+		code := generateJavaScriptCode(data, resolvePrettierConfig(outputPathConfig.Path))
 		fileName := toCamelCase(serviceName) + "Api.js"
 		if _, err := os.Stat(outputPathConfig.Path); err != nil {
 			if os.IsNotExist(err) {
@@ -548,33 +550,131 @@ func generateTypeScriptCode(data ServiceInfo) []byte {
 	return buf.Bytes()
 }
 
-// generateJavaScriptCode 按 addressApi.js 风格生成 JS：无类型 import，(data, opts) => service.{method}('path', data, opts)
-// opts 透传给 request 层（per-call 选项：toast/dedupe 等）
-func generateJavaScriptCode(data ServiceInfo) []byte {
-	var buf bytes.Buffer
-	buf.WriteString("import service from '")
-	buf.WriteString(data.ServiceImport)
-	buf.WriteString("';\n\n")
-	buf.WriteString("export const ")
-	buf.WriteString(data.ApiFileName)
-	buf.WriteString(" = {\n")
-	for i, method := range data.Methods {
-		buf.WriteString("    ")
-		buf.WriteString(method.MethodName)
-		buf.WriteString(": (data, opts) => service.")
-		buf.WriteString(method.HttpMethod)
-		buf.WriteString("('")
-		buf.WriteString(method.HttpPath)
-		buf.WriteString("', data, opts)")
-		if i < len(data.Methods)-1 {
-			buf.WriteString(",\n")
-		} else {
-			buf.WriteString("\n")
+// prettierConfig 收集生成 JS 时需要遵循的 prettier 选项（只取本生成器用得到的几项）。
+type prettierConfig struct {
+	Semi          bool   // 行尾分号
+	SingleQuote   bool   // 单引号
+	TabWidth      int    // 缩进宽度
+	PrintWidth    int    // 单行最大宽度（超出则在 => 后换行）
+	TrailingComma string // "none" | "es5" | "all"：是否给对象最后一个属性补尾逗号
+}
+
+// prettier v3 默认值：semi=true, singleQuote=false, tabWidth=2, printWidth=80, trailingComma="all"。
+// 找不到任何 .prettierrc 时回退到这里，输出即与 prettier 默认风格一致。
+func defaultPrettierConfig() prettierConfig {
+	return prettierConfig{Semi: true, SingleQuote: false, TabWidth: 2, PrintWidth: 80, TrailingComma: "all"}
+}
+
+// prettierRaw 用指针字段区分「未设置」与「显式设为零值」，便于只覆盖出现过的键。
+type prettierRaw struct {
+	Semi          *bool   `json:"semi"`
+	SingleQuote   *bool   `json:"singleQuote"`
+	TabWidth      *int    `json:"tabWidth"`
+	PrintWidth    *int    `json:"printWidth"`
+	TrailingComma *string `json:"trailingComma"`
+}
+
+// resolvePrettierConfig 从输出目录向上逐级查找 prettier 配置（.prettierrc.json / .prettierrc / package.json 的 prettier 字段），
+// 命中第一个即停止。找不到则返回 prettier 默认值。
+func resolvePrettierConfig(outputDir string) prettierConfig {
+	cfg := defaultPrettierConfig()
+	dir, err := filepath.Abs(outputDir)
+	if err != nil {
+		return cfg
+	}
+	for {
+		if raw, ok := readPrettierRaw(dir); ok {
+			applyPrettierRaw(&cfg, raw)
+			return cfg
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return cfg
+		}
+		dir = parent
+	}
+}
+
+// readPrettierRaw 在单个目录里按 prettier 的优先级尝试读取配置，只有真正含 prettier 选项时才返回 ok=true。
+func readPrettierRaw(dir string) (prettierRaw, bool) {
+	// .prettierrc.json 与 .prettierrc（本仓库均为 JSON 内容）直接整体反序列化
+	for _, name := range []string{".prettierrc.json", ".prettierrc"} {
+		if b, err := os.ReadFile(filepath.Join(dir, name)); err == nil {
+			var raw prettierRaw
+			if json.Unmarshal(b, &raw) == nil {
+				return raw, true
+			}
 		}
 	}
-	buf.WriteString("};\n\n")
-	buf.WriteString("export default ")
-	buf.WriteString(data.ApiFileName)
-	buf.WriteString(";\n")
+	// package.json 的 prettier 字段（不含该字段则视为未命中，继续向上找）
+	if b, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
+		var pkg struct {
+			Prettier *prettierRaw `json:"prettier"`
+		}
+		if json.Unmarshal(b, &pkg) == nil && pkg.Prettier != nil {
+			return *pkg.Prettier, true
+		}
+	}
+	return prettierRaw{}, false
+}
+
+// applyPrettierRaw 把出现过的键覆盖到 cfg 上。
+func applyPrettierRaw(cfg *prettierConfig, raw prettierRaw) {
+	if raw.Semi != nil {
+		cfg.Semi = *raw.Semi
+	}
+	if raw.SingleQuote != nil {
+		cfg.SingleQuote = *raw.SingleQuote
+	}
+	if raw.TabWidth != nil && *raw.TabWidth > 0 {
+		cfg.TabWidth = *raw.TabWidth
+	}
+	if raw.PrintWidth != nil && *raw.PrintWidth > 0 {
+		cfg.PrintWidth = *raw.PrintWidth
+	}
+	if raw.TrailingComma != nil {
+		cfg.TrailingComma = *raw.TrailingComma
+	}
+}
+
+// generateJavaScriptCode 按 addressApi.js 风格生成 JS：无类型 import，(data, opts) => service.{method}('path', data, opts)。
+// 输出严格对齐目标项目的 prettier 配置（缩进/分号/引号/尾逗号/行宽换行），避免生成后被重新格式化。
+// opts 透传给 request 层（per-call 选项：toast/dedupe 等）。
+func generateJavaScriptCode(data ServiceInfo, cfg prettierConfig) []byte {
+	quote := "\""
+	if cfg.SingleQuote {
+		quote = "'"
+	}
+	semi := ""
+	if cfg.Semi {
+		semi = ";"
+	}
+	indent := strings.Repeat(" ", cfg.TabWidth)
+	contIndent := strings.Repeat(" ", cfg.TabWidth*2) // 换行后调用体多缩进一级
+	// es5/all 都会给多行对象的最后一个属性补尾逗号；none 不补
+	lastComma := cfg.TrailingComma != "none"
+
+	q := func(s string) string { return quote + s + quote }
+
+	var buf bytes.Buffer
+	buf.WriteString("import service from " + q(data.ServiceImport) + semi + "\n\n")
+	buf.WriteString("export const " + data.ApiFileName + " = {\n")
+	for i, method := range data.Methods {
+		comma := ","
+		if i == len(data.Methods)-1 && !lastComma {
+			comma = ""
+		}
+		head := indent + method.MethodName + ": (data, opts) => "
+		call := "service." + method.HttpMethod + "(" + q(method.HttpPath) + ", data, opts)"
+		if len(head)+len(call)+len(comma) > cfg.PrintWidth {
+			// 超出行宽：prettier 会在 => 后换行
+			buf.WriteString(indent + method.MethodName + ": (data, opts) =>\n")
+			buf.WriteString(contIndent + call + comma + "\n")
+		} else {
+			buf.WriteString(head + call + comma + "\n")
+		}
+	}
+	buf.WriteString("}" + semi + "\n\n")
+	buf.WriteString("export default " + data.ApiFileName + semi + "\n")
 	return buf.Bytes()
 }

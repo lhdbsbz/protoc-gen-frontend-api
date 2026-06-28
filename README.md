@@ -63,14 +63,17 @@ protoc --proto_path=. --proto_path=proto_third \
 
 ## 生成物示例
 
+每个输出目录除 `*Api` 文件外，还会写入一个 **`grpcGatewayHelper.{ts,js}`**（运行时静态部分由插件 `runtime/` 下的真实源文件经 `//go:embed` 注入，仅替换 import 占位符）。`*Api` 文件 `import service from '../grpcGatewayHelper'`，方法签名统一为 `(data, opts) => service.{post|stream|websocket}(path, data, opts[, reqBytesPaths, respBytesPaths])`。
+
 **TS（`userApi.ts`）**
 
 ```ts
-import service from '@/api/api';
+import service from '../grpcGatewayHelper';
 import type { GetUserReq, GetUserResp } from '@/api/proto-types/proto/user/user';
 
 export const userApi = {
-  GetUser: (data: GetUserReq): Promise<GetUserResp> => service.post('/xxx/UserService/GetUser', data),
+  GetUser: (data: GetUserReq, opts?: object): Promise<GetUserResp> =>
+    service.post('/grpc-gateway/UserService/GetUser', data, opts),
 };
 export default userApi;
 ```
@@ -78,21 +81,39 @@ export default userApi;
 **JS（`userApi.js`）**
 
 ```js
-import service from '@/api/api.js';
+import service from '../grpcGatewayHelper';
 
 export const userApi = {
-  GetUser: (data) => service.post('/xxx/UserService/GetUser', data),
+  GetUser: (data, opts) => service.post('/grpc-gateway/UserService/GetUser', data, opts),
 };
 export default userApi;
 ```
 
 `UserService` → 文件名 `userApi`。
 
+### 流式 / WebSocket
+
+`stream` 的服务端流式 RPC 走 `service.stream`；客户端流式（双向）RPC 自动生成 `/grpc-web-websocket/<Service>/<Method>` 路由并走 `service.websocket`。
+
+### bytes 自动编解码
+
+后端 protojson 把 proto 的 `bytes` 字段编码为 base64 字符串。插件按方法 **Input/Output 描述符**算出 bytes 字段路径（覆盖嵌套 / oneof / repeated / map），内联到调用点（无 bytes 的方法不追加，保持原样）：
+
+```js
+// CompanionService.Session: SessionRequest/SessionResponse 的 audio.data 是 bytes
+Session: (data, opts) =>
+  service.websocket('/grpc-web-websocket/CompanionService/Session', data, opts, [["audio","data"]], [["audio","data"]]),
+```
+
+helper 据此在出入站自动转换：响应 base64→`Uint8Array`，请求 `Uint8Array`→base64（post/stream/websocket 三通道皆覆盖；多端通用 base64 编解码，优先 `atob`/`btoa`，无则走手写表）。**业务层双向只面对 `Uint8Array`。**
+
 ---
 
-## 对 service 模块的要求
+## 对 base service 模块的要求
 
-`service_import` / `service_import_js` 指向的模块需 **默认导出** 含 `get`、`post`、`put`、`delete`、`patch` 的对象（如 axios 实例）。
+`service_import` / `service_import_js` 指向的模块（即 `grpcGatewayHelper` 内部 `import` 的"基础传输层"，通常是各前端的 `request.{js,ts}`）需 **默认导出** 含 `post` 的对象（可选 `get`、`buildHeaders`/`getHeaders`、`baseUrl`/`BASE_URL` 供流式/WS 用）。
+
+> **注意循环依赖**：base service 模块**不要反向 `import` 本 helper**——helper 单向依赖 base service 即可。helper 顶层以惰性 `getBaseService()` 读取其 default，避免模块求值期 TDZ。
 
 ---
 

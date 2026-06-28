@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/genproto/googleapis/api/annotations"
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
@@ -33,11 +35,15 @@ type PluginConfig struct {
 
 // 方法信息结构体
 type MethodInfo struct {
-	MethodName   string // 方法名称
-	HttpPath     string // HTTP 路径
-	HttpMethod   string // HTTP 方法（post, get等）
-	RequestType  string // 请求类型名称（用于 TS）
-	ResponseType string // 响应类型名称（用于 TS）
+	MethodName        string // 方法名称
+	HttpPath          string // HTTP 路径
+	HttpMethod        string // HTTP 方法（post, get等，或者 websocket）
+	RequestType       string // 请求类型名称（用于 TS）
+	ResponseType      string // 响应类型名称（用于 TS）
+	IsStreamingServer bool
+	IsStreamingClient bool
+	ReqBytesPaths     string // 请求消息的 bytes 字段路径 JS 字面量（如 [["audio","data"]]）；无则空串
+	RespBytesPaths    string // 响应消息的 bytes 字段路径 JS 字面量；无则空串
 }
 
 // 服务信息结构体
@@ -48,6 +54,7 @@ type ServiceInfo struct {
 	ServiceImport string              // service 模块路径
 	TypesRoot     string              // ts-proto 类型根路径前缀
 	TypeImports   map[string][]string // importPath -> sorted type names
+	ProtoFilePath string              // proto 源文件路径
 }
 
 func main() {
@@ -75,6 +82,9 @@ func main() {
 			}
 		}
 
+		tsDirsWritten := make(map[string]string)
+		jsDirsWritten := make(map[string]string)
+
 		for _, f := range gen.Files {
 			if !f.Generate {
 				continue
@@ -83,11 +93,28 @@ func main() {
 			// 查找服务定义
 			for _, service := range f.Services {
 				// 生成前端 API 文件
-				if err := generateFrontendApi(gen, f, service, config); err != nil {
+				if err := generateFrontendApi(gen, f, service, config, tsDirsWritten, jsDirsWritten); err != nil {
 					return err
 				}
 			}
 		}
+
+		// 写入 grpcGatewayHelper 文件到所有被写入的目录
+		for dir, serviceImport := range tsDirsWritten {
+			helperContent := strings.ReplaceAll(grpcGatewayHelperTS, "BASE_SERVICE_IMPORT_PLACEHOLDER", serviceImport)
+			helperPath := filepath.Join(dir, "grpcGatewayHelper.ts")
+			if err := os.WriteFile(helperPath, []byte(helperContent), 0644); err != nil {
+				return fmt.Errorf("写入 TS 助手文件失败 %s: %v", helperPath, err)
+			}
+		}
+		for dir, serviceImport := range jsDirsWritten {
+			helperContent := strings.ReplaceAll(grpcGatewayHelperJS, "BASE_SERVICE_IMPORT_PLACEHOLDER", serviceImport)
+			helperPath := filepath.Join(dir, "grpcGatewayHelper.js")
+			if err := os.WriteFile(helperPath, []byte(helperContent), 0644); err != nil {
+				return fmt.Errorf("写入 JS 助手文件失败 %s: %v", helperPath, err)
+			}
+		}
+
 		return nil
 	})
 }
@@ -192,8 +219,20 @@ func parseTargetPaths(value string) []OutputPathConfig {
 	return paths
 }
 
+// getProtoRelDir 从 proto 文件路径推导相对目录
+func getProtoRelDir(protoFilePath string) string {
+	p := strings.ReplaceAll(protoFilePath, "\\", "/")
+	p = strings.TrimPrefix(p, "proto/")
+	p = strings.TrimPrefix(p, "proto_third/")
+	dir := filepath.Dir(p)
+	if dir == "." || dir == "/" {
+		return ""
+	}
+	return dir
+}
+
 // generateFrontendApi 生成前端 API 文件
-func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *protogen.Service, config *PluginConfig) error {
+func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *protogen.Service, config *PluginConfig, tsDirsWritten, jsDirsWritten map[string]string) error {
 	// 服务名称（去掉 Service 后缀）
 	serviceName := strings.TrimSuffix(string(service.Desc.Name()), "Service")
 
@@ -203,18 +242,36 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 	// 提取方法信息
 	var methods []MethodInfo
 	for _, method := range service.Methods {
-		// 只处理有 HTTP 注解的方法
-		if httpRule := extractHttpRule(method); httpRule != nil {
-			// 获取请求和响应类型名称
+		httpRule := extractHttpRule(method)
+		isStreamingClient := method.Desc.IsStreamingClient()
+		isStreamingServer := method.Desc.IsStreamingServer()
+
+		// 只有带 HTTP 注解的方法，或者包含 WebSocket 流式方法，才生成前端接口
+		if httpRule != nil || isStreamingClient {
 			requestType := string(method.Input.Desc.Name())
 			responseType := string(method.Output.Desc.Name())
 
+			path := ""
+			httpMethod := ""
+			if httpRule != nil {
+				path = httpRule.Path
+				httpMethod = strings.ToLower(httpRule.Method)
+			} else {
+				// 自动生成的 WebSocket 网关路由路径
+				path = "/grpc-web-websocket/" + serviceName + "Service/" + string(method.Desc.Name())
+				httpMethod = "websocket"
+			}
+
 			methodInfo := MethodInfo{
-				MethodName:   string(method.Desc.Name()),
-				HttpPath:     httpRule.Path,
-				HttpMethod:   strings.ToLower(httpRule.Method),
-				RequestType:  requestType,
-				ResponseType: responseType,
+				MethodName:        string(method.Desc.Name()),
+				HttpPath:          path,
+				HttpMethod:        httpMethod,
+				RequestType:       requestType,
+				ResponseType:      responseType,
+				IsStreamingServer: isStreamingServer,
+				IsStreamingClient: isStreamingClient,
+				ReqBytesPaths:     bytesPathsToJSLiteral(collectBytesPaths(method.Input.Desc)),
+				RespBytesPaths:    bytesPathsToJSLiteral(collectBytesPaths(method.Output.Desc)),
 			}
 			methods = append(methods, methodInfo)
 		}
@@ -240,6 +297,16 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 			serviceImport = config.ServiceImport
 		}
 
+		// 若基本输出目录不存在，跳过该路径，不报错
+		if _, err := os.Stat(outputPathConfig.Path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("检查输出目录失败 %s: %v", outputPathConfig.Path, err)
+		}
+
+		tsDirsWritten[outputPathConfig.Path] = serviceImport
+
 		// 准备模板数据
 		data := ServiceInfo{
 			ServiceName:   serviceName,
@@ -248,21 +315,27 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 			ServiceImport: serviceImport,
 			TypesRoot:     config.TypesRoot,
 			TypeImports:   typeImports,
+			ProtoFilePath: file.Desc.Path(),
 		}
 
 		// 生成 TypeScript 代码
 		code := generateTypeScriptCode(data)
 		fileName := toCamelCase(serviceName) + "Api.ts"
 
-		// 若输出目录不存在，跳过该路径，不报错
-		if _, err := os.Stat(outputPathConfig.Path); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return fmt.Errorf("检查输出目录失败 %s: %v", outputPathConfig.Path, err)
+		// 从 proto 文件路径推导相对目录并拼装目标目录
+		protoFilePath := file.Desc.Path()
+		relDir := getProtoRelDir(protoFilePath)
+		targetDir := outputPathConfig.Path
+		if relDir != "" {
+			targetDir = filepath.Join(outputPathConfig.Path, relDir)
 		}
 
-		fullPath := filepath.Join(outputPathConfig.Path, fileName)
+		// 创建级联子目录
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			return fmt.Errorf("创建子目录失败 %s: %v", targetDir, err)
+		}
+
+		fullPath := filepath.Join(targetDir, fileName)
 		if err := os.WriteFile(fullPath, code, 0644); err != nil {
 			return fmt.Errorf("写入文件失败 %s: %v", fullPath, err)
 		}
@@ -276,22 +349,41 @@ func generateFrontendApi(gen *protogen.Plugin, file *protogen.File, service *pro
 		if serviceImport == "" {
 			serviceImport = config.ServiceImport
 		}
-		data := ServiceInfo{
-			ServiceName:   serviceName,
-			ApiFileName:   apiFileName,
-			Methods:       methods,
-			ServiceImport: serviceImport,
-		}
-		// 按目标目录所属项目的 prettier 配置生成，避免生成后被编辑器/lint-staged 重新格式化
-		code := generateJavaScriptCode(data, resolvePrettierConfig(outputPathConfig.Path))
-		fileName := toCamelCase(serviceName) + "Api.js"
+
 		if _, err := os.Stat(outputPathConfig.Path); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return fmt.Errorf("检查输出目录失败(JS) %s: %v", outputPathConfig.Path, err)
 		}
-		fullPath := filepath.Join(outputPathConfig.Path, fileName)
+
+		jsDirsWritten[outputPathConfig.Path] = serviceImport
+
+		data := ServiceInfo{
+			ServiceName:   serviceName,
+			ApiFileName:   apiFileName,
+			Methods:       methods,
+			ServiceImport: serviceImport,
+			ProtoFilePath: file.Desc.Path(),
+		}
+		// 按目标目录所属项目的 prettier 配置生成，避免生成后被编辑器/lint-staged 重新格式化
+		code := generateJavaScriptCode(data, resolvePrettierConfig(outputPathConfig.Path))
+		fileName := toCamelCase(serviceName) + "Api.js"
+
+		// 从 proto 文件路径推导相对目录并拼装目标目录
+		protoFilePath := file.Desc.Path()
+		relDir := getProtoRelDir(protoFilePath)
+		targetDir := outputPathConfig.Path
+		if relDir != "" {
+			targetDir = filepath.Join(outputPathConfig.Path, relDir)
+		}
+
+		// 创建级联子目录
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			return fmt.Errorf("创建子目录失败(JS) %s: %v", targetDir, err)
+		}
+
+		fullPath := filepath.Join(targetDir, fileName)
 		if err := os.WriteFile(fullPath, code, 0644); err != nil {
 			return fmt.Errorf("写入文件失败(JS) %s: %v", fullPath, err)
 		}
@@ -403,6 +495,74 @@ func uniqueAndSort(strs []string) []string {
 
 // collectTypeImports 收集所有需要的类型导入信息
 // 只收集请求和响应类型本身，不递归收集嵌套类型（因为 TypeScript 类型系统会自动处理）
+// collectBytesPaths 遍历消息描述符，算出所有 bytes 字段的 JSON key 路径（protojson 用 JSONName=lowerCamel）。
+// - bytes / repeated bytes / map<_,bytes> 均终止于该字段（运行时叶子转换器统一处理标量/数组/map）。
+// - 递归进入 message 字段；以"当前在栈上"的 FullName 集合阻断自引用环（A→B→A），
+//   但允许同一类型在不同分支重复出现（菱形）。
+// 纯函数，便于单测。
+func collectBytesPaths(msg protoreflect.MessageDescriptor) [][]string {
+	var out [][]string
+	onStack := map[protoreflect.FullName]bool{}
+
+	var walk func(m protoreflect.MessageDescriptor, prefix []string)
+	walk = func(m protoreflect.MessageDescriptor, prefix []string) {
+		if onStack[m.FullName()] {
+			return
+		}
+		onStack[m.FullName()] = true
+		defer delete(onStack, m.FullName())
+
+		fields := m.Fields()
+		for i := 0; i < fields.Len(); i++ {
+			f := fields.Get(i)
+			path := append(append([]string{}, prefix...), f.JSONName())
+
+			if f.IsMap() {
+				// protoreflect 把 map 表示为 repeated MapEntry message。
+				if f.MapValue().Kind() == protoreflect.BytesKind {
+					out = append(out, path) // map<_,bytes>：值为 {k: base64}
+				}
+				continue // map<_,message> 不递归（罕见、当前无）
+			}
+
+			switch f.Kind() {
+			case protoreflect.BytesKind:
+				out = append(out, path)
+			case protoreflect.MessageKind, protoreflect.GroupKind:
+				walk(f.Message(), path)
+			}
+		}
+	}
+	walk(msg, nil)
+	return out
+}
+
+// bytesPathsToJSLiteral 把路径列表序列化为 JS/TS 数组字面量（双引号，JS/TS 均合法）；空则返回空串。
+func bytesPathsToJSLiteral(paths [][]string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(paths)
+	return string(b)
+}
+
+// bytesPathArgs 生成调用点要追加的 reqPaths/respPaths 实参串（", [...], [...]"）。
+// 仅当请求或响应任一侧含 bytes 时才追加；无 bytes 的方法返回空串，调用点保持原样。
+func bytesPathArgs(m MethodInfo) string {
+	if m.ReqBytesPaths == "" && m.RespBytesPaths == "" {
+		return ""
+	}
+	reqLit := m.ReqBytesPaths
+	if reqLit == "" {
+		reqLit = "[]"
+	}
+	respLit := m.RespBytesPaths
+	if respLit == "" {
+		respLit = "[]"
+	}
+	return ", " + reqLit + ", " + respLit
+}
+
 // 返回 map[importPath][]sortedTypeNames，避免重复分组
 // methods 参数用于匹配哪些方法需要处理（避免重复调用 extractHttpRule）
 func collectTypeImports(gen *protogen.Plugin, service *protogen.Service, methods []MethodInfo) map[string][]string {
@@ -484,10 +644,10 @@ func protoFileToImportPath(protoFilePath string) string {
 func generateTypeScriptCode(data ServiceInfo) []byte {
 	var buf bytes.Buffer
 
-	// 写入 service import
-	serviceImport := data.ServiceImport
+	// 写入 service import (改为引用生成的 grpcGatewayHelper)
+	helperPath := getHelperRelativeImportPath(data.ProtoFilePath)
 	buf.WriteString("import service from '")
-	buf.WriteString(serviceImport)
+	buf.WriteString(helperPath)
 	buf.WriteString("';\n")
 
 	// 写入类型定义导入（从 ts-proto 生成的文件导入），按 importPath 排序以保证生成稳定
@@ -526,14 +686,25 @@ func generateTypeScriptCode(data ServiceInfo) []byte {
 		buf.WriteString(method.MethodName)
 		buf.WriteString(": (data: ")
 		buf.WriteString(method.RequestType)
-		buf.WriteString(", opts?: object): Promise<")
-		buf.WriteString(method.ResponseType)
-		buf.WriteString("> =>\n")
-		buf.WriteString("    service.")
-		buf.WriteString(method.HttpMethod)
-		buf.WriteString("('")
-		buf.WriteString(method.HttpPath)
-		buf.WriteString("', data, opts)")
+
+		returnType := "Promise<" + method.ResponseType + ">"
+		pathArgs := bytesPathArgs(method)
+		call := ""
+		if method.HttpMethod == "websocket" {
+			returnType = "any"
+			call = "service.websocket('" + method.HttpPath + "', data, opts" + pathArgs + ")"
+		} else if method.IsStreamingServer {
+			returnType = "any"
+			call = "service.stream('" + method.HttpPath + "', data, opts" + pathArgs + ")"
+		} else {
+			call = "service." + method.HttpMethod + "('" + method.HttpPath + "', data, opts" + pathArgs + ")"
+		}
+
+		buf.WriteString(", opts?: object): ")
+		buf.WriteString(returnType)
+		buf.WriteString(" =>\n")
+		buf.WriteString("    ")
+		buf.WriteString(call)
 
 		if i < len(data.Methods)-1 {
 			buf.WriteString(",\n")
@@ -657,7 +828,8 @@ func generateJavaScriptCode(data ServiceInfo, cfg prettierConfig) []byte {
 	q := func(s string) string { return quote + s + quote }
 
 	var buf bytes.Buffer
-	buf.WriteString("import service from " + q(data.ServiceImport) + semi + "\n\n")
+	helperPath := getHelperRelativeImportPath(data.ProtoFilePath)
+	buf.WriteString("import service from " + q(helperPath) + semi + "\n\n")
 	buf.WriteString("export const " + data.ApiFileName + " = {\n")
 	for i, method := range data.Methods {
 		comma := ","
@@ -665,7 +837,16 @@ func generateJavaScriptCode(data ServiceInfo, cfg prettierConfig) []byte {
 			comma = ""
 		}
 		head := indent + method.MethodName + ": (data, opts) => "
-		call := "service." + method.HttpMethod + "(" + q(method.HttpPath) + ", data, opts)"
+
+		call := ""
+		if method.HttpMethod == "websocket" {
+			call = "service.websocket(" + q(method.HttpPath) + ", data, opts" + bytesPathArgs(method) + ")"
+		} else if method.IsStreamingServer {
+			call = "service.stream(" + q(method.HttpPath) + ", data, opts" + bytesPathArgs(method) + ")"
+		} else {
+			call = "service." + method.HttpMethod + "(" + q(method.HttpPath) + ", data, opts" + bytesPathArgs(method) + ")"
+		}
+
 		if len(head)+len(call)+len(comma) > cfg.PrintWidth {
 			// 超出行宽：prettier 会在 => 后换行
 			buf.WriteString(indent + method.MethodName + ": (data, opts) =>\n")
@@ -678,3 +859,26 @@ func generateJavaScriptCode(data ServiceInfo, cfg prettierConfig) []byte {
 	buf.WriteString("export default " + data.ApiFileName + semi + "\n")
 	return buf.Bytes()
 }
+
+func getHelperRelativeImportPath(protoFilePath string) string {
+	relDir := getProtoRelDir(protoFilePath)
+	if relDir == "" {
+		return "./grpcGatewayHelper"
+	}
+	parts := strings.Split(strings.ReplaceAll(relDir, "\\", "/"), "/")
+	var sb strings.Builder
+	for i := 0; i < len(parts); i++ {
+		sb.WriteString("../")
+	}
+	sb.WriteString("grpcGatewayHelper")
+	return sb.String()
+}
+
+// grpcGatewayHelper 的静态运行时：从真实源文件嵌入，而非内联 Go 字符串。
+// 这样它能被 eslint/prettier/tsc 检查、能写单测；唯一的模板化是 BASE_SERVICE_IMPORT_PLACEHOLDER。
+//
+//go:embed runtime/grpcGatewayHelper.ts
+var grpcGatewayHelperTS string
+
+//go:embed runtime/grpcGatewayHelper.js
+var grpcGatewayHelperJS string

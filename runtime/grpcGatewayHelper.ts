@@ -325,15 +325,20 @@ class GrpcWebWebSocketClient {
             }
         }
 
+        // session token 走 WS 子协议（Sec-WebSocket-Protocol），不进 URL —— 浏览器 WebSocket API
+        // 无法设置自定义请求头，子协议是唯一不污染 URL 的鉴权通道，token 因此不再落入网关/反代
+        // access log 与浏览器历史。后端 AppUser 中间件从该头解析 'lmcl.bearer.<token>'；升级握手时
+        // gorilla 仍回选 'grpc-websockets'，token 子协议仅承载鉴权、不参与协议协商。
+        // (JWT 字符集为 base64url + '.'，本身即合法 HTTP token，无需再编码。)
+        const subprotocols = ['grpc-websockets'];
         const token = getSessionToken();
         if (token) {
-            const separator = wsUrl.includes('?') ? '&' : '?';
-            wsUrl = wsUrl + separator + 'token=' + encodeURIComponent(token);
+            subprotocols.push('lmcl.bearer.' + token);
         }
 
         const creator = activeAdapter.createWebSocket || ((u, p) => new BrowserWebSocketWrapper(u, p));
         try {
-            this.socket = creator(wsUrl, ['grpc-websockets']);
+            this.socket = creator(wsUrl, subprotocols);
         } catch (err: any) {
             setTimeout(() => opts.onError?.(err), 0);
             return;

@@ -4,32 +4,11 @@ import * as baseServiceModule from 'BASE_SERVICE_IMPORT_PLACEHOLDER';
 // 改为惰性读取：下面所有用到 baseService 的地方都在函数运行时才调用，那时 request.js 已初始化完毕。
 const getBaseService = () => baseServiceModule.default || baseServiceModule;
 
-// ==================== UTF-8 Polyfill ====================
-function stringToUint8Array(str) {
-    const arr = [];
-    for (let i = 0; i < str.length; i++) {
-        const code = str.charCodeAt(i);
-        if (code < 0x80) {
-            arr.push(code);
-        } else if (code < 0x800) {
-            arr.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
-        } else if (code < 0xd800 || code >= 0xe000) {
-            arr.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
-        } else {
-            i++;
-            const nextCode = str.charCodeAt(i);
-            const utf32 = 0x10000 + (((code & 0x3ff) << 10) | (nextCode & 0x3ff));
-            arr.push(
-                0xf0 | (utf32 >> 18),
-                0x80 | ((utf32 >> 12) & 0x3f),
-                0x80 | ((utf32 >> 6) & 0x3f),
-                0x80 | (utf32 & 0x3f)
-            );
-        }
-    }
-    return new Uint8Array(arr);
-}
+// 多路复用帧编解码与 bytes 字段分离器（由插件一同写入同目录）
+import { FrameType, encodeFrame, decodeFrame } from './muxframe.js';
+import { deflate, inflate } from './muxcodec.js';
 
+// ==================== UTF-8 Polyfill ====================
 function uint8ArrayToString(arr) {
     let str = '';
     for (let i = 0; i < arr.length; i++) {
@@ -257,19 +236,168 @@ class BrowserWebSocketWrapper {
     }
 }
 
-class GrpcWebWebSocketClient {
-    constructor(url, opts = {}) {
-        this.opts = opts;
-        this.isOpened = false;
-        this.sendQueue = [];
-        this._reqBytesPaths = opts._reqBytesPaths;   // 出站帧 bytes 路径（send 时编码）
-        this._respBytesPaths = opts._respBytesPaths; // 入站帧 bytes 路径（onMessage 时解码）
+// ==================== MuxConnection 单例 + StreamHandle ====================
+// 一条共享 WS（/_mux）多路复用所有逻辑流，取代原来"每次调用一条 WS"的做法。
 
+/** 发送队列上限：超出时丢弃最旧的帧并告警（客户端背压极少触顶） */
+const SEND_QUEUE_CAP = 1024;
+
+/** 心跳间隔（毫秒） */
+const HEARTBEAT_INTERVAL_MS = 30000;
+
+/** 指数退避重连延迟初始值与上限 */
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
+
+/** 每条逻辑流的公共句柄，调用方依赖此接口（不改变签名）。 */
+class StreamHandle {
+    constructor(id, mux, opts, reqPaths, respPaths) {
+        this.id = id;
+        this.mux = mux;
+        this.opts = opts;
+        this.reqPaths = reqPaths;
+        this.respPaths = respPaths;
+        this.ended = false;
+    }
+
+    /** 连接已建立且本流未结束 */
+    get isOpened() {
+        return this.mux.isOpen && !this.ended;
+    }
+
+    /** 发送业务消息：deflate(bytes 字段分离) → 入队 MSG 帧 */
+    send(msg) {
+        if (this.ended) return;
+        const { json, segs } = deflate(msg, this.reqPaths || []);
+        this.mux.enqueue(encodeFrame({ type: FrameType.Msg, streamId: this.id, json, byteSegs: segs }));
+    }
+
+    /** 半关闭（客户端发送完毕，等待服务端响应） */
+    halfClose() {
+        if (this.ended) return;
+        this.mux.enqueue(encodeFrame({ type: FrameType.HalfClose, streamId: this.id }));
+    }
+
+    /** 主动关闭：发 RESET 帧并本地清理 */
+    close() {
+        if (this.ended) return;
+        this.ended = true;
+        this.mux.enqueue(encodeFrame({ type: FrameType.Reset, streamId: this.id }));
+        this.mux.removeStream(this.id);
+    }
+
+    /** 收到服务端 MSG 帧时调用，inflate 后转交业务回调 */
+    onMsg(json, byteSegs) {
+        try {
+            const obj = inflate(json, byteSegs, this.respPaths || []);
+            this.opts.onMessage?.(obj);
+        } catch (e) {
+            console.error('MuxConnection: inflate MSG 失败', e);
+        }
+    }
+
+    /** 收到 END 帧时调用（code=0 → onClose，否则 onError） */
+    onEnd(code, message) {
+        if (this.ended) return;
+        this.ended = true;
+        if (code === 0) {
+            this.opts.onClose?.();
+        } else {
+            this.opts.onError?.(new Error(message || '流结束，code=' + code));
+        }
+    }
+
+    /** 收到 RESET 帧时调用 */
+    onReset(message) {
+        if (this.ended) return;
+        this.ended = true;
+        this.opts.onError?.(new Error(message || '流被重置'));
+    }
+
+    /** socket open 时触发 onOpen 回调（并在有 _initData 时发送初始消息） */
+    fireOpen(initData) {
+        this.opts.onOpen?.();
+        if (initData && typeof initData === 'object' && Object.keys(initData).length > 0) {
+            this.send(initData);
+        }
+    }
+}
+
+/**
+ * 模块级单例多路复用 WS 连接。
+ * 持一条 WS 到 /<wsBase>/grpc-web-websocket/_mux，内部维护 streamId→StreamHandle 映射。
+ */
+class MuxConnection {
+    constructor() {
+        this.socket = null;
+        /** 当前 socket 已 open */
+        this.isOpen = false;
+        this.streams = new Map();
+        this.nextId = 0;
+        /** 未发出的已编码帧（socket 尚未 open 时暂存） */
+        this.sendQueue = [];
+        /** socket open 时待触发的 {handle, initData} 列表 */
+        this.pendingOpens = [];
+        this.heartbeatTimer = null;
+        this.reconnectTimer = null;
+        this.reconnectCount = 0;
+        /** 是否已被显式销毁（不再重连） */
+        this.destroyed = false;
+    }
+
+    /** 分配下一个流 ID，建/复用连接，返回 StreamHandle */
+    openStream(path, opts) {
+        const id = ++this.nextId;
+        const method = path.replace(/^\/grpc-web-websocket/, '');
+        const handle = new StreamHandle(id, this, opts, opts._reqBytesPaths, opts._respBytesPaths);
+        this.streams.set(id, handle);
+
+        // 入队 OPEN 帧
+        this.enqueue(encodeFrame({ type: FrameType.Open, streamId: id, method, metadata: new Uint8Array() }));
+
+        // 建连（若尚未建立）
+        if (!this.socket) {
+            this._connect();
+        }
+
+        if (this.isOpen) {
+            // socket 已 open：同步触发 onOpen（乐观路径）
+            handle.fireOpen(opts._initData);
+        } else {
+            // socket 未 open：open 后再触发
+            this.pendingOpens.push({ handle, initData: opts._initData });
+        }
+
+        return handle;
+    }
+
+    /** 入队一个已编码帧；超出上限时丢弃最旧帧并告警 */
+    enqueue(frame) {
+        if (this.isOpen && this.socket) {
+            // socket 已 open，直接发送
+            this.socket.send(frame.buffer);
+        } else {
+            if (this.sendQueue.length >= SEND_QUEUE_CAP) {
+                console.warn('MuxConnection: sendQueue 已满，丢弃最旧帧');
+                this.sendQueue.shift();
+            }
+            this.sendQueue.push(frame);
+        }
+    }
+
+    /** 从 streams 表移除（由 StreamHandle.close / onEnd / onReset 调用） */
+    removeStream(id) {
+        this.streams.delete(id);
+    }
+
+    /** 构建 WS URL，与旧 GrpcWebWebSocketClient 逻辑一致，末尾固定为 /_mux */
+    _buildWsUrl() {
         const key1 = 'BASE_URL';
         const key2 = 'baseUrl';
         const baseService = getBaseService();
-        const baseUrl = baseServiceModule[key1] || baseServiceModule[key2] || baseService[key2] || baseService[key1] || "";
-        const finalUrl = url.startsWith('http') ? url : (baseUrl ? (baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl) + url : url);
+        const baseUrl = baseServiceModule[key1] || baseServiceModule[key2] || baseService[key2] || baseService[key1] || '';
+        const path = '/grpc-web-websocket/_mux';
+        const finalUrl = baseUrl ? (baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl) + path : path;
         let wsUrl = finalUrl.replace(/^http/, 'ws');
         if (wsUrl.startsWith('/')) {
             if (typeof window !== 'undefined' && window.location) {
@@ -277,123 +405,191 @@ class GrpcWebWebSocketClient {
                 wsUrl = origin + wsUrl;
             }
         }
+        return wsUrl;
+    }
 
-        // session token 走 WS 子协议（Sec-WebSocket-Protocol），不进 URL —— 浏览器 WebSocket API
-        // 无法设置自定义请求头，子协议是唯一不污染 URL 的鉴权通道，token 因此不再落入网关/反代
-        // access log 与浏览器历史。后端 AppUser 中间件从该头解析 'lmcl.bearer.<token>'；升级握手时
-        // gorilla 仍回选 'grpc-websockets'，token 子协议仅承载鉴权、不参与协议协商。
-        // (JWT 字符集为 base64url + '.'，本身即合法 HTTP token，无需再编码。)
+    /** 建立 WS 连接（重连时同样调用） */
+    _connect() {
+        if (this.destroyed || this.socket) return;
+
+        const wsUrl = this._buildWsUrl();
+
+        // session token 走 WS 子协议（与旧实现一致）
         const subprotocols = ['grpc-websockets'];
         const token = getSessionToken();
-        if (token) {
-            subprotocols.push('lmcl.bearer.' + token);
-        }
+        if (token) subprotocols.push('lmcl.bearer.' + token);
 
         const creator = activeAdapter.createWebSocket || ((u, p) => new BrowserWebSocketWrapper(u, p));
         try {
             this.socket = creator(wsUrl, subprotocols);
         } catch (err) {
-            setTimeout(() => opts.onError?.(err), 0);
+            console.error('MuxConnection: 创建 socket 失败', err);
+            this._scheduleReconnect();
             return;
         }
 
         this.socket.onopen = () => {
-            this.isOpened = true;
-            for (const msg of this.sendQueue) {
-                this.socket.send(msg);
+            this.isOpen = true;
+            this.reconnectCount = 0;
+
+            // 刷新 sendQueue
+            for (const frame of this.sendQueue) {
+                this.socket.send(frame.buffer);
             }
             this.sendQueue = [];
-            opts.onOpen?.();
+
+            // 触发待 open 的流
+            for (const { handle, initData } of this.pendingOpens) {
+                handle.fireOpen(initData);
+            }
+            this.pendingOpens = [];
+
+            // 启动心跳
+            this._startHeartbeat();
         };
 
         this.socket.onmessage = (event) => {
-            const view = new Uint8Array(event.data);
-            if (view.length < 5) return;
+            try {
+                const frame = decodeFrame(new Uint8Array(event.data));
+                const handle = this.streams.get(frame.streamId);
 
-            const flags = view[0];
-            const length = (view[1] << 24) | (view[2] << 16) | (view[3] << 8) | view[4];
-
-            if (flags === 0x00) {
-                const payloadData = view.slice(5, 5 + length);
-                const jsonStr = uint8ArrayToString(payloadData);
-                try {
-                    const parsed = JSON.parse(jsonStr);
-                    if (this._respBytesPaths) applyBytesPaths(parsed, this._respBytesPaths, decodeLeaf);
-                    opts.onMessage?.(parsed);
-                } catch (e) {
-                    console.error("Failed to parse WebSocket JSON payload:", jsonStr, e);
+                switch (frame.type) {
+                    case FrameType.Msg:
+                        handle?.onMsg(frame.json || new Uint8Array(), frame.byteSegs || []);
+                        break;
+                    case FrameType.End:
+                        if (handle) {
+                            handle.onEnd(frame.code ?? 0, frame.message || '');
+                            this.streams.delete(frame.streamId);
+                        }
+                        break;
+                    case FrameType.Reset:
+                        if (handle) {
+                            handle.onReset(frame.message || '');
+                            this.streams.delete(frame.streamId);
+                        }
+                        break;
+                    case FrameType.TokenRefresh:
+                        // 更新本地 session token
+                        if (frame.token) {
+                            try { localStorage.setItem('x-session-id', frame.token); } catch {}
+                        }
+                        break;
+                    case FrameType.Pong:
+                        // 服务端 pong，忽略即可
+                        break;
+                    default:
+                        break;
                 }
-            } else if (flags === 0x80) {
-                const trailerStr = uint8ArrayToString(view.slice(5, 5 + length));
-                this._parseTrailer(trailerStr);
-                this.close();
+            } catch (e) {
+                console.error('MuxConnection: decodeFrame 失败', e);
             }
         };
 
         this.socket.onclose = () => {
-            opts.onClose?.();
+            this._onSocketClosed();
         };
 
         this.socket.onerror = (err) => {
-            opts.onError?.(err instanceof Error ? err : new Error(String(err)));
+            console.error('MuxConnection: socket 错误', err);
+            // onerror 之后通常紧跟 onclose，让 onclose 负责重连
         };
     }
 
-    send(data) {
-        if (this._reqBytesPaths) applyBytesPaths(data, this._reqBytesPaths, encodeLeaf);
-        const jsonStr = JSON.stringify(data);
-        const pbBytes = stringToUint8Array(jsonStr);
-        const buf = new ArrayBuffer(5 + pbBytes.length);
-        const view = new Uint8Array(buf);
-        view[0] = 0x00;
-        view[1] = (pbBytes.length >> 24) & 0xFF;
-        view[2] = (pbBytes.length >> 16) & 0xFF;
-        view[3] = (pbBytes.length >> 8) & 0xFF;
-        view[4] = pbBytes.length & 0xFF;
-        view.set(pbBytes, 5);
+    /** socket 关闭后的清理与重连调度 */
+    _onSocketClosed() {
+        this.isOpen = false;
+        this.socket = null;
+        this._stopHeartbeat();
 
-        if (this.isOpened && this.socket) {
-            this.socket.send(buf);
-        } else {
-            this.sendQueue.push(buf);
+        // 通知所有活跃流关闭
+        for (const [, handle] of this.streams) {
+            handle.opts.onClose?.();
+        }
+        this.streams.clear();
+        this.pendingOpens = [];
+
+        if (!this.destroyed) {
+            this._scheduleReconnect();
         }
     }
 
-    halfClose() {
-        const buf = new ArrayBuffer(5);
-        const view = new Uint8Array(buf);
-        view[0] = 0x80;
-        view[1] = 0; view[2] = 0; view[3] = 0; view[4] = 0;
-
-        if (this.isOpened && this.socket) {
-            this.socket.send(buf);
-        } else {
-            this.sendQueue.push(buf);
-        }
-    }
-
-    close() {
-        this.socket?.close();
-    }
-
-    _parseTrailer(str) {
-        let code = 0;
-        let message = "OK";
-        const lines = str.split('\r\n');
-        for (const line of lines) {
-            const parts = line.split(': ');
-            if (parts[0] === 'grpc-status') {
-                code = parseInt(parts[1], 10);
-            } else if (parts[0] === 'grpc-message') {
-                message = parts[1];
+    /** 指数退避重连（1s→2s→...→30s 上限） */
+    _scheduleReconnect() {
+        if (this.destroyed || this.reconnectTimer) return;
+        this.reconnectCount++;
+        const delay = Math.min(RECONNECT_BASE_MS * Math.pow(2, this.reconnectCount - 1), RECONNECT_MAX_MS);
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            if (!this.destroyed && !this.socket) {
+                this._connect();
             }
-        }
-        if (code !== 0) {
-            this.opts.onError?.(new Error(message));
-        } else {
-            this.opts.onSuccess?.();
+        }, delay);
+    }
+
+    /** 定期发送 PING 帧（streamId=0）维持连接活跃 */
+    _startHeartbeat() {
+        this._stopHeartbeat();
+        this.heartbeatTimer = setInterval(() => {
+            if (this.isOpen && this.socket) {
+                const frame = encodeFrame({ type: FrameType.Ping, streamId: 0 });
+                this.socket.send(frame.buffer);
+            }
+        }, HEARTBEAT_INTERVAL_MS);
+    }
+
+    _stopHeartbeat() {
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
         }
     }
+}
+
+/** 模块级 MuxConnection 单例（懒建，首次 openStream 时创建） */
+let _mux = null;
+
+function getMux() {
+    if (!_mux) _mux = new MuxConnection();
+    return _mux;
+}
+
+/**
+ * 主动销毁多路复用连接（用于登出等场景）。
+ * 调用后：停止重连调度、清除心跳、关闭 socket、向所有活跃流触发 onClose、
+ * 清空流表，并将单例重置为 null——下一次 openStream 将重建全新连接。
+ *
+ * 注意：不会因 token 缺失而自动调用（匿名连接如 web/memory 须正常重连）；
+ * 仅此显式调用才会抑制重连。
+ */
+export function disconnectMux() {
+    if (!_mux) return;
+    const mux = _mux;
+    _mux = null;
+
+    // 标记已销毁，阻止 _scheduleReconnect 内部的 _connect 回调
+    mux.destroyed = true;
+
+    // 清除重连定时器
+    if (mux.reconnectTimer) {
+        clearTimeout(mux.reconnectTimer);
+        mux.reconnectTimer = null;
+    }
+
+    // 停止心跳
+    mux._stopHeartbeat();
+
+    // 关闭 socket（触发 onclose，但 destroyed=true 不会重连）
+    if (mux.socket) {
+        try { mux.socket.close(); } catch {}
+    }
+
+    // 向所有活跃流触发 onClose，并清空流表
+    for (const [, handle] of mux.streams) {
+        try { handle.opts.onClose?.(); } catch {}
+    }
+    mux.streams.clear();
+    mux.pendingOpens = [];
 }
 
 // ==================== Export wrapped service ====================
@@ -421,9 +617,8 @@ const service = {
         }
         return reqStream(url, data, finalOpts);
     },
-    websocket: (url, data, opts, reqPaths, respPaths) => {
-        return new GrpcWebWebSocketClient(url, { ...opts, ...data, _reqBytesPaths: reqPaths, _respBytesPaths: respPaths });
-    }
+    websocket: (url, data, opts, reqPaths, respPaths) =>
+        getMux().openStream(url, { ...opts, _initData: data, _reqBytesPaths: reqPaths, _respBytesPaths: respPaths }),
 };
 
 export default service;

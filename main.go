@@ -106,12 +106,26 @@ func main() {
 			if err := os.WriteFile(helperPath, []byte(helperContent), 0644); err != nil {
 				return fmt.Errorf("写入 TS 助手文件失败 %s: %v", helperPath, err)
 			}
+			// muxframe / muxcodec 无占位符，原样写入（与 grpcGatewayHelper 同目录）
+			if err := os.WriteFile(filepath.Join(dir, "muxframe.ts"), []byte(muxframeTS), 0644); err != nil {
+				return fmt.Errorf("写入 muxframe.ts 失败 %s: %v", dir, err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "muxcodec.ts"), []byte(muxcodecTS), 0644); err != nil {
+				return fmt.Errorf("写入 muxcodec.ts 失败 %s: %v", dir, err)
+			}
 		}
 		for dir, serviceImport := range jsDirsWritten {
 			helperContent := strings.ReplaceAll(grpcGatewayHelperJS, "BASE_SERVICE_IMPORT_PLACEHOLDER", serviceImport)
 			helperPath := filepath.Join(dir, "grpcGatewayHelper.js")
 			if err := os.WriteFile(helperPath, []byte(helperContent), 0644); err != nil {
 				return fmt.Errorf("写入 JS 助手文件失败 %s: %v", helperPath, err)
+			}
+			// muxframe / muxcodec 无占位符，原样写入（与 grpcGatewayHelper 同目录）
+			if err := os.WriteFile(filepath.Join(dir, "muxframe.js"), []byte(muxframeJS), 0644); err != nil {
+				return fmt.Errorf("写入 muxframe.js 失败 %s: %v", dir, err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "muxcodec.js"), []byte(muxcodecJS), 0644); err != nil {
+				return fmt.Errorf("写入 muxcodec.js 失败 %s: %v", dir, err)
 			}
 		}
 
@@ -882,3 +896,18 @@ var grpcGatewayHelperTS string
 
 //go:embed runtime/grpcGatewayHelper.js
 var grpcGatewayHelperJS string
+
+// muxframe / muxcodec：多路复用帧编解码与 bytes 字段分离器。
+// 无占位符，原样写出到各输出目录（与 grpcGatewayHelper 同目录，可直接 import）。
+//
+//go:embed runtime/muxframe.ts
+var muxframeTS string
+
+//go:embed runtime/muxframe.js
+var muxframeJS string
+
+//go:embed runtime/muxcodec.ts
+var muxcodecTS string
+
+//go:embed runtime/muxcodec.js
+var muxcodecJS string

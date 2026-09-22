@@ -1,7 +1,5 @@
 import * as baseServiceModule from 'BASE_SERVICE_IMPORT_PLACEHOLDER';
-// 循环依赖：request.js 反过来也 import 本模块（default），所以这里不能在模块求值阶段读取它的 default
-// （此时 request.js 的 export default 可能尚未执行 → TDZ "Cannot access 'default' before initialization"）。
-// 改为惰性读取：下面所有用到 baseService 的地方都在函数运行时才调用，那时 request.js 已初始化完毕。
+// Helper and request import each other; resolve the transport at call time.
 const getBaseService = () => baseServiceModule.default || baseServiceModule;
 
 // ==================== UTF-8 Polyfill ====================

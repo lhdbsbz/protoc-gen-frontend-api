@@ -48,9 +48,9 @@ type MethodInfo struct {
 
 // 服务信息结构体
 type ServiceInfo struct {
-	ServiceName     string              // 服务名称（去掉 Service 后缀）
-	ApiFileName     string              // API 文件名（如 productApi）
-	Methods         []MethodInfo        // 方法列表
+	ServiceName   string              // 服务名称（去掉 Service 后缀）
+	ApiFileName   string              // API 文件名（如 productApi）
+	Methods       []MethodInfo        // 方法列表
 	ServiceImport string              // service 模块路径
 	TypesRoot     string              // ts-proto 类型根路径前缀
 	TypeImports   map[string][]string // importPath -> sorted type names
@@ -488,9 +488,10 @@ func uniqueAndSort(strs []string) []string {
 // collectTypeImports 收集所有需要的类型导入信息
 // 只收集请求和响应类型本身，不递归收集嵌套类型（因为 TypeScript 类型系统会自动处理）
 // collectBytesPaths 遍历消息描述符，算出所有 bytes 字段的 JSON key 路径（protojson 用 JSONName=lowerCamel）。
-// - bytes / repeated bytes / map<_,bytes> 均终止于该字段（运行时叶子转换器统一处理标量/数组/map）。
-// - 递归进入 message 字段；以"当前在栈上"的 FullName 集合阻断自引用环（A→B→A），
-//   但允许同一类型在不同分支重复出现（菱形）。
+//   - bytes / repeated bytes / map<_,bytes> 均终止于该字段（运行时叶子转换器统一处理标量/数组/map）。
+//   - 递归进入 message 字段；以"当前在栈上"的 FullName 集合阻断自引用环（A→B→A），
+//     但允许同一类型在不同分支重复出现（菱形）。
+//
 // 纯函数，便于单测。
 func collectBytesPaths(msg protoreflect.MessageDescriptor) [][]string {
 	var out [][]string
@@ -558,18 +559,17 @@ func bytesPathArgs(m MethodInfo) string {
 // 返回 map[importPath][]sortedTypeNames，避免重复分组
 // methods 参数用于匹配哪些方法需要处理（避免重复调用 extractHttpRule）
 func collectTypeImports(gen *protogen.Plugin, service *protogen.Service, methods []MethodInfo) map[string][]string {
-	// 创建方法名到 MethodInfo 的映射，用于快速查找
-	methodMap := make(map[string]bool)
+	methodInfoByName := make(map[string]MethodInfo)
 	for _, m := range methods {
-		methodMap[m.MethodName] = true
+		methodInfoByName[m.MethodName] = m
 	}
 
 	typeFileMap := make(map[string]string) // typeName -> protoFilePath
 
 	// 从实际的 method 对象中收集请求和响应类型（使用已提取的 methods 避免重复调用 extractHttpRule）
 	for _, method := range service.Methods {
-		// 只处理在 methods 列表中的方法（这些已经通过 extractHttpRule 验证）
-		if !methodMap[string(method.Desc.Name())] {
+		info, ok := methodInfoByName[string(method.Desc.Name())]
+		if !ok {
 			continue
 		}
 
@@ -580,6 +580,11 @@ func collectTypeImports(gen *protogen.Plugin, service *protogen.Service, methods
 			if fileDesc := method.Input.Desc.ParentFile(); fileDesc != nil {
 				typeFileMap[typeName] = fileDesc.Path()
 			}
+		}
+
+		// Streaming RPCs call helper.stream; the chunk type is not in the generated signature.
+		if info.IsStreamingServer {
+			continue
 		}
 
 		// 收集响应类型
@@ -638,7 +643,7 @@ func generateTypeScriptCode(data ServiceInfo) []byte {
 
 	// 写入 service import (改为引用生成的 grpcGatewayHelper)
 	helperPath := getHelperRelativeImportPath(data.ProtoFilePath)
-	buf.WriteString("import service from '")
+	buf.WriteString("import service, { type JsonReq } from '")
 	buf.WriteString(helperPath)
 	buf.WriteString("';\n")
 
@@ -676,8 +681,9 @@ func generateTypeScriptCode(data ServiceInfo) []byte {
 	for i, method := range data.Methods {
 		buf.WriteString("  ")
 		buf.WriteString(method.MethodName)
-		buf.WriteString(": (data: ")
+		buf.WriteString(": (data: JsonReq<")
 		buf.WriteString(method.RequestType)
+		buf.WriteString(">")
 
 		returnType := "Promise<" + method.ResponseType + ">"
 		pathArgs := bytesPathArgs(method)

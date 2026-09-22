@@ -68,11 +68,11 @@ protoc --proto_path=. --proto_path=proto_third \
 **TS（`userApi.ts`）**
 
 ```ts
-import service from '../grpcGatewayHelper';
+import service, { type JsonReq } from '../grpcGatewayHelper';
 import type { GetUserReq, GetUserResp } from '@/api/proto-types/proto/user/user';
 
 export const userApi = {
-  GetUser: (data: GetUserReq, opts?: object): Promise<GetUserResp> =>
+  GetUser: (data: JsonReq<GetUserReq>, opts?: object): Promise<GetUserResp> =>
     service.post('/grpc-gateway/UserService/GetUser', data, opts),
 };
 export default userApi;

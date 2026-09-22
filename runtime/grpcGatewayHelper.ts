@@ -1,8 +1,15 @@
 import * as baseServiceModule from 'BASE_SERVICE_IMPORT_PLACEHOLDER';
-// 循环依赖：request 反过来也可能 import 本模块（default），所以这里不能在模块求值阶段读取它的 default
-// （此时 request 的 export default 可能尚未执行 → TDZ "Cannot access 'default' before initialization"）。
-// 改为惰性读取：下面所有用到 baseService 的地方都在函数运行时才调用，那时 request 已初始化完毕。
+// Helper and request import each other; resolve the transport at call time.
 const getBaseService = (): any => baseServiceModule.default || baseServiceModule;
+
+/** JSON request: proto3 fields optional; EntityId/string stay string; int32/float accept number|string. */
+export type JsonReq<T> =
+  T extends Uint8Array ? T | string :
+  T extends Array<infer U> ? Array<JsonReq<U>> :
+  T extends string ? string :
+  T extends object ? (keyof T extends never ? Record<string, unknown> : { [K in keyof T]?: JsonReq<T[K]> }) :
+  T extends number ? number | string :
+  T;
 
 // ==================== UTF-8 Polyfill ====================
 function uint8ArrayToString(arr: Uint8Array): string {
